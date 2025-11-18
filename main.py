@@ -180,7 +180,7 @@ def create_apartment(data: ApartmentCreate, user: AuthUser = Depends(require_rol
         video_url=data.video_url,
         is_available=True,
     )
-    inserted = db["apartment"].insert_one(apt.model_dump())
+    inserted = db["apartment"].insert_one(apt.model_dump() | {"created_at": datetime.now(timezone.utc)})
     return {"id": str(inserted.inserted_id)}
 
 @app.get("/apartments")
@@ -218,7 +218,7 @@ def add_review(apt_id: str, payload: ReviewSchema, user: AuthUser = Depends(requ
     if payload.apartment_id != apt_id:
         raise HTTPException(status_code=400, detail="Mismatched apartment id")
     entry = payload.model_dump()
-    entry.update({"user_id": user.id})
+    entry.update({"user_id": user.id, "created_at": datetime.now(timezone.utc)})
     db["review"].insert_one(entry)
     # Update rating aggregate
     stats = list(db["review"].aggregate([
@@ -250,7 +250,7 @@ def create_thread(vendor_id: str, user: AuthUser = Depends(require_role(["user"]
     existing = db["messagethread"].find_one({"student_id": user.id, "vendor_id": vendor_id})
     if existing:
         return {"id": str(existing["_id"]) }
-    thread = MessageThreadSchema(student_id=user.id, vendor_id=vendor_id)
+    thread = MessageThreadSchema(student_id=user.id, vendor_id=vendor_id, last_time=datetime.now(timezone.utc))
     inserted = db["messagethread"].insert_one(thread.model_dump())
     return {"id": str(inserted.inserted_id)}
 
@@ -269,7 +269,7 @@ def send_message(payload: SendMessage, user: AuthUser = Depends(require_role(["u
     if user.role == "vendor" and thread["vendor_id"] != user.id:
         raise HTTPException(status_code=403, detail="Not participant")
     msg = MessageSchema(thread_id=payload.thread_id, from_user_id=user.id, to_user_id=(thread["vendor_id"] if user.role=="user" else thread["student_id"]), body=payload.body)
-    db["message"].insert_one(msg.model_dump())
+    db["message"].insert_one(msg.model_dump() | {"created_at": datetime.now(timezone.utc)})
     db["messagethread"].update_one({"_id": ObjectId(payload.thread_id)}, {"$set": {"last_message": payload.body, "last_time": datetime.now(timezone.utc)}})
     return SimpleOK(ok=True)
 
@@ -300,7 +300,7 @@ def create_booking(payload: BookingCreate, user: AuthUser = Depends(require_role
     if not apt:
         raise HTTPException(status_code=404, detail="Apartment not found")
     entry = BookingSchema(apartment_id=payload.apartment_id, user_id=user.id, vendor_id=str(apt["vendor_id"]) if isinstance(apt["vendor_id"], ObjectId) else apt["vendor_id"], message=payload.message)
-    db["bookinginterest"].insert_one(entry.model_dump())
+    db["bookinginterest"].insert_one(entry.model_dump() | {"created_at": datetime.now(timezone.utc)})
     return SimpleOK(ok=True)
 
 @app.get("/bookings")
@@ -348,6 +348,103 @@ class ListingDecision(BaseModel):
 def admin_toggle_listing(payload: ListingDecision, user: AuthUser = Depends(require_role(["admin"]))):
     db["apartment"].update_one({"_id": ObjectId(payload.id)}, {"$set": {"is_available": payload.is_available}})
     return SimpleOK(ok=True)
+
+# Dev Seed
+class SeedResponse(BaseModel):
+    ok: bool
+    vendor_email: Optional[str] = None
+    vendor_password: Optional[str] = None
+    student_email: Optional[str] = None
+    student_password: Optional[str] = None
+    created: int = 0
+
+@app.post("/dev/seed", response_model=SeedResponse)
+def seed_demo():
+    # Only seed if there are no apartments yet
+    if db["apartment"].count_documents({}) > 0:
+        return SeedResponse(ok=True, created=0)
+
+    # Create demo users if not exist
+    def ensure_user(email: str, role: str, name: str, password: str) -> str:
+        existing = db["user"].find_one({"email": email})
+        if existing:
+            return str(existing["_id"])
+        hashed = pwd_context.hash(password)
+        user = UserSchema(role=role, full_name=name, email=email, password_hash=hashed, is_verified=True)
+        uid = db["user"].insert_one(user.model_dump() | {"created_at": datetime.now(timezone.utc)}).inserted_id
+        return str(uid)
+
+    vendor_id = ensure_user("vendor@igloo.dev", "vendor", "Demo Vendor", "vendor123")
+    student_id = ensure_user("student@igloo.dev", "user", "Demo Student", "student123")
+
+    demo_photos = [
+        "https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?q=80&w=1400&auto=format&fit=crop",
+        "https://images.unsplash.com/photo-1505691723518-36a5ac3b2f74?q=80&w=1400&auto=format&fit=crop",
+        "https://images.unsplash.com/photo-1501045661006-fcebe0257c3f?q=80&w=1400&auto=format&fit=crop"
+    ]
+
+    demos = [
+        {
+            "title": "Modern Studio near UNILAG",
+            "description": "Cozy furnished studio, 5 mins to campus, free Wi‑Fi and constant water.",
+            "school": "UNILAG",
+            "location": "Yaba, Lagos",
+            "price_monthly": 120000,
+            "type": "studio",
+            "distance_km": 1.2,
+            "amenities": ["wifi","water","power"],
+            "photos": demo_photos,
+        },
+        {
+            "title": "Self‑contain by UI gate",
+            "description": "Spacious self‑contain, prepaid meter, borehole, secure compound.",
+            "school": "UI",
+            "location": "Agbowo, Ibadan",
+            "price_monthly": 85000,
+            "type": "self-contained",
+            "distance_km": 0.8,
+            "amenities": ["water","power"],
+            "photos": demo_photos[::-1],
+        },
+        {
+            "title": "2‑bed shared apartment UNN",
+            "description": "Tasteful shared 2‑bed, each room en‑suite, generator and Wi‑Fi.",
+            "school": "UNN",
+            "location": "Nsukka, Enugu",
+            "price_monthly": 95000,
+            "type": "shared",
+            "distance_km": 1.9,
+            "amenities": ["wifi","power"],
+            "photos": demo_photos,
+        },
+    ]
+
+    created = 0
+    for d in demos:
+        apt = ApartmentSchema(
+            vendor_id=vendor_id,
+            title=d["title"],
+            description=d["description"],
+            school=d["school"],
+            location=d["location"],
+            price_monthly=d["price_monthly"],
+            type=d["type"],
+            distance_km=d["distance_km"],
+            amenities=d["amenities"],
+            photos=d["photos"],
+            is_available=True,
+        )
+        db["apartment"].insert_one(apt.model_dump() | {"created_at": datetime.now(timezone.utc)})
+        created += 1
+
+    return SeedResponse(
+        ok=True,
+        vendor_email="vendor@igloo.dev",
+        vendor_password="vendor123",
+        student_email="student@igloo.dev",
+        student_password="student123",
+        created=created,
+    )
 
 # Health/Test
 @app.get("/test")
